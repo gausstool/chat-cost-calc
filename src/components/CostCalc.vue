@@ -1,11 +1,12 @@
 <script setup lang="ts">
 import { ref, computed } from "vue";
 
-const sessions = ref(50);
-const interactions = ref(5);
+const sessions = ref(10);
+const interactions = ref(50);
 const inputTokens = ref(500);
 const outputTokens = ref(2000);
 
+const cacheEnabled = ref(true);
 const cacheHitPrice = ref(0.02);
 const cacheMissPrice = ref(1);
 const outputPrice = ref(2);
@@ -28,11 +29,22 @@ const cacheMissInputTokens = computed(
   () => totalInteractions.value * inputTokens.value,
 );
 
+const totalInputTokens = computed(
+  () => cacheHitInputTokens.value + cacheMissInputTokens.value,
+);
+
+const effectiveCacheHitInputTokens = computed(
+  () => (cacheEnabled.value ? cacheHitInputTokens.value : 0),
+);
+const effectiveCacheMissInputTokens = computed(
+  () => (cacheEnabled.value ? cacheMissInputTokens.value : totalInputTokens.value),
+);
+
 const costCacheMiss = computed(
-  () => (cacheMissInputTokens.value / 1_000_000) * cacheMissPrice.value,
+  () => (effectiveCacheMissInputTokens.value / 1_000_000) * cacheMissPrice.value,
 );
 const costCacheHit = computed(
-  () => (cacheHitInputTokens.value / 1_000_000) * cacheHitPrice.value,
+  () => (effectiveCacheHitInputTokens.value / 1_000_000) * cacheHitPrice.value,
 );
 const costOutput = computed(
   () => (totalOutputTokens.value / 1_000_000) * outputPrice.value,
@@ -55,13 +67,21 @@ function formatMoney(n: number): string {
       <div class="column">
         <h2>价格(每百万 Token)</h2>
         <div class="form">
-          <label>
+          <label class="toggle-row">
+            <span>支持缓存</span>
+            <label class="switch">
+              <input type="checkbox" v-model="cacheEnabled" />
+              <span class="slider"></span>
+            </label>
+          </label>
+          <label :class="{ disabled: !cacheEnabled }">
             <span>输入（命中缓存）</span>
             <input
               v-model.number="cacheHitPrice"
               type="number"
               min="0"
               step="0.01"
+              :disabled="!cacheEnabled"
             />
           </label>
           <label>
@@ -110,14 +130,14 @@ function formatMoney(n: number): string {
       <div class="column">
         <h2>预估消耗</h2>
         <div class="results">
-          <div class="card highlight">
+          <div class="card highlight" :class="{ dimmed: !cacheEnabled }">
             <span class="label">输入（命中缓存）</span>
-            <span class="value">{{ formatNum(cacheHitInputTokens) }}</span>
+            <span class="value">{{ formatNum(effectiveCacheHitInputTokens) }}</span>
             <span class="cost">{{ formatMoney(costCacheHit) }}</span>
           </div>
           <div class="card highlight">
             <span class="label">输入（未命中缓存）</span>
-            <span class="value">{{ formatNum(cacheMissInputTokens) }}</span>
+            <span class="value">{{ formatNum(effectiveCacheMissInputTokens) }}</span>
             <span class="cost">{{ formatMoney(costCacheMiss) }}</span>
           </div>
           <div class="card highlight">
@@ -174,6 +194,54 @@ h2 {
   gap: 6px;
   font-size: 13px;
 }
+.form label.disabled {
+  opacity: 0.4;
+  pointer-events: none;
+}
+.toggle-row {
+  flex-direction: row !important;
+  align-items: center;
+  justify-content: space-between;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--border);
+}
+.switch {
+  position: relative;
+  display: inline-block;
+  width: 40px;
+  height: 22px;
+  flex-shrink: 0;
+}
+.switch input {
+  opacity: 0;
+  width: 0;
+  height: 0;
+}
+.slider {
+  position: absolute;
+  cursor: pointer;
+  inset: 0;
+  background: var(--border);
+  border-radius: 22px;
+  transition: 0.3s;
+}
+.slider::before {
+  content: "";
+  position: absolute;
+  height: 16px;
+  width: 16px;
+  left: 3px;
+  bottom: 3px;
+  background: #fff;
+  border-radius: 50%;
+  transition: 0.3s;
+}
+.switch input:checked + .slider {
+  background: var(--accent);
+}
+.switch input:checked + .slider::before {
+  transform: translateX(18px);
+}
 .form input {
   width: 100%;
   padding: 8px 12px;
@@ -212,6 +280,9 @@ h2 {
 .card.highlight {
   background: var(--accent-bg);
   border: 1px solid var(--accent-border);
+}
+.card.dimmed {
+  opacity: 0.35;
 }
 .card.total {
   background: var(--accent);
