@@ -16,8 +16,8 @@ EOF
 
 # 构建
 echo "正在构建..."
-npm i
-npm run build
+pnpm i
+pnpm build
 
 # 进入构建目录
 cd dist/chat-cost-calc
