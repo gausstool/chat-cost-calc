@@ -2,20 +2,30 @@
 import { ref, computed } from "vue";
 
 const sessions = ref(10);
-const interactions = ref(50);
-const inputTokens = ref(500);
+const interactions = ref(20);
+const inputTokens = ref(100);
 const outputTokens = ref(2000);
 
 const cacheEnabled = ref(true);
-const cacheHitPrice = ref(0.02);
-const cacheMissPrice = ref(1);
-const outputPrice = ref(2);
+const cacheHitPrice = ref(0.05);
+const cacheMissPrice = ref(1.5);
+const outputPrice = ref(4.5);
 
 const totalInteractions = computed(() => sessions.value * interactions.value);
 
 const totalOutputTokens = computed(
   () => totalInteractions.value * outputTokens.value,
 );
+
+// 平均会话上下文长度：单次会话内逐次累积的上下文（输入侧）总长度，
+// 与命中缓存公式一致（= cacheHitInputTokens / sessions）
+const avgContextPerSession = computed(() => {
+  const n = interactions.value;
+  return (
+    (inputTokens.value * n * (n + 1)) / 2 +
+    (outputTokens.value * (n - 1) * n) / 2
+  );
+});
 
 const cacheHitInputTokens = computed(() => {
   const n = interactions.value;
@@ -140,6 +150,10 @@ function formatMoney(n: number): string {
                 <span>每次交互输出 Token</span>
                 <input v-model.number="outputTokens" type="number" min="1" />
               </label>
+              <div class="result-row">
+                <span>平均会话上下文长度</span>
+                <span class="value">{{ formatNum(avgContextPerSession) }}</span>
+              </div>
             </div>
           </div>
         </GCol>
@@ -291,6 +305,24 @@ h2 {
   font-size: 12px;
   color: var(--text);
   text-align: center;
+}
+
+.result-row {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 13px;
+}
+
+.result-row .value {
+  padding: 8px 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--accent-bg);
+  color: var(--accent);
+  font: 15px var(--mono);
+  text-align: right;
+  box-sizing: border-box;
 }
 
 .results {
