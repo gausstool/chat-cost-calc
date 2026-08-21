@@ -1,20 +1,30 @@
 <script setup lang="ts">
 import { ref, computed } from "vue";
 
-const sessions = ref(10);
-const interactions = ref(20);
+const sessions = ref(1);
+const interactions = ref(22);
 const inputTokens = ref(100);
-const outputTokens = ref(2000);
 
-// 工具调用模拟参数（真实 Agent 会话：工具定义常驻、交互内含多轮工具循环）
-const toolEnabled = ref(false);
-const toolCount = ref(3); // 工具定义数量
-const toolDefTokens = ref(300); // 每个工具定义的平均 Token
-const toolRounds = ref(2); // 每次交互平均工具调用轮次
-const toolResultTokens = ref(400); // 每轮工具结果回传输入 Token
-const toolCallTokens = ref(300); // 每轮工具调用（tool_use）输出 Token
+// 系统提示词：真实 Agent 会话中每轮请求都携带的常驻上下文（可缓存）
+const systemPromptTokens = ref(3000);
+
+// 工具调用模拟参数（真实 Agent 会话：轮 → 步 → 工具调用的三层结构）
+const toolCount = ref(10); // 工具定义数量
+const toolDefTokens = ref(100); // 每个工具定义的平均 Token
+const toolSteps = ref(4); // 每轮对话平均工具调用步数
+const toolCallsPerStep = ref(2); // 每步平均并行工具调用数
+const toolResultTokens = ref(400); // 每工具调用结果回传输入 Token
+const toolCallOutputTokens = ref(150); // 每工具调用输出 Token（tool_use 生成）
+
+// Agent 输出：平均每步思考（reasoning，每次 LLM 调用都有，计输出；
+//            携带 tools 时按拼接规则进入上下文、参与缓存）
+//            + 平均每轮正文输出（最终回复，每轮一份，计输出、进入上下文）
+const thinkingTokensPerStep = ref(350); // 平均每步思考 Token
+const replyTokensPerRound = ref(650); // 平均每轮正文输出 Token
 
 const cacheEnabled = ref(true);
+// 缓存命中概率：每一步 LLM 调用有 p 概率命中缓存，否则缓存前缀整段失效按未命中计费
+const cacheHitProb = ref(0.99);
 const peakEnabled = ref(false);
 const cacheHitPrice = ref(0.05);
 const cacheMissPrice = ref(1.5);
@@ -22,48 +32,90 @@ const outputPrice = ref(4.5);
 
 const totalInteractions = computed(() => sessions.value * interactions.value);
 
-// 扩展段模型：每次交互的输入段 = 用户消息 + 工具结果回传（tool_result）
-const inSeg = computed(() =>
-  inputTokens.value +
-  (toolEnabled.value ? toolRounds.value * toolResultTokens.value : 0),
+// 每轮 LLM 调用总步数 = 工具调用步数 + 1 次最终回复步（每步都是一次实际 LLM 调用）
+const llmCallsPerRound = computed(() => toolSteps.value + 1);
+
+// 固定上下文前缀：系统提示词 + 工具定义（真实 Agent 会话中每轮请求携带，可缓存）
+const constDef = computed(
+  () => systemPromptTokens.value + toolCount.value * toolDefTokens.value,
 );
-// 每次交互的输出段 = 最终答案 + 工具调用（tool_use）输出
-const outSeg = computed(() =>
-  outputTokens.value +
-  (toolEnabled.value ? toolRounds.value * toolCallTokens.value : 0),
-);
-// 工具定义前缀：真实 Agent 会话中每轮请求都会携带工具 schema（可缓存常量）
-const toolDef = computed(() =>
-  toolEnabled.value ? toolCount.value * toolDefTokens.value : 0,
+
+// 是否携带 tools 参数（有工具定义即携带）：按 DeepSeek 多轮拼接规则，
+// 携带 tools 时思维链必须拼接进上下文并回传（参与缓存前缀）；
+// 未携带 tools 时思维链不参与上下文拼接
+const hasTools = computed(() => toolCount.value > 0);
+
+// ── 模拟计算：逐会话、逐轮、逐步（每次 LLM 调用）累计输入命中 / 未命中 ──
+// 每次 LLM 调用时（期望值口径，p = 缓存命中概率）：
+//  - 命中缓存输入 = p × (固定前缀 + 历史上下文)
+//  - 未命中缓存输入 = 本次新增（用户消息 / 工具结果回传）+ (1-p) × (前缀 + 历史上下文)
+//    （即每一步有 1-p 概率缓存丢失，前缀与历史整段按未命中计费）
+//  - 工具步调用输出 tool_use；最终回复步调用新增输入为 0；
+//  - 思考（reasoning）总会计入输出费用；携带 tools 时拼接进上下文，否则不进入
+const simulateSession = computed(() => {
+  const p = cacheHitProb.value;
+  let cacheHit = 0;
+  let cacheMiss = 0;
+  let context = 0; // 会话内已累积的上下文（历史输入 + 历史输出，含思考当携带 tools）
+  for (let r = 0; r < interactions.value; r++) {
+    // LLM 调用 1：新增用户消息；若有工具步则输出 tool_use，否则直接输出正文
+    const req1 = constDef.value + context;
+    cacheHit += p * req1;
+    cacheMiss += inputTokens.value + (1 - p) * req1;
+    context += inputTokens.value;
+    if (toolSteps.value > 0) {
+      context += toolCallsPerStep.value * toolCallOutputTokens.value;
+    }
+    if (hasTools.value) context += thinkingTokensPerStep.value;
+    // 工具调用步：每步回填工具结果后触发一次新的 LLM 调用
+    for (let s = 1; s <= toolSteps.value; s++) {
+      const toolIn = toolCallsPerStep.value * toolResultTokens.value;
+      const req = constDef.value + context;
+      cacheHit += p * req;
+      cacheMiss += toolIn + (1 - p) * req;
+      context += toolIn;
+      // 该步调用输出 tool_use 并进入上下文（最后一步除外，其输出为正文）
+      if (s < toolSteps.value) {
+        context += toolCallsPerStep.value * toolCallOutputTokens.value;
+      }
+      if (hasTools.value) context += thinkingTokensPerStep.value;
+    }
+    // 最终回复步：请求输入与上一步完全相同（新增输入为 0），输出思考+正文
+    const reqF = constDef.value + context;
+    cacheHit += p * reqF;
+    cacheMiss += (1 - p) * reqF;
+    context += (hasTools.value ? thinkingTokensPerStep.value : 0);
+    context += replyTokensPerRound.value;
+  }
+  return { cacheHit, cacheMiss, context };
+});
+
+// 每轮输出 = 工具调用生成 + 思考（每次 LLM 调用都有）+ 每轮正文
+const outputPerRound = computed(
+  () =>
+    toolSteps.value *
+      toolCallsPerStep.value *
+      toolCallOutputTokens.value +
+    llmCallsPerRound.value * thinkingTokensPerStep.value +
+    replyTokensPerRound.value,
 );
 
 const totalOutputTokens = computed(
-  () => totalInteractions.value * outSeg.value,
+  () => totalInteractions.value * outputPerRound.value,
 );
 
-// 平均会话上下文长度：单次会话内逐次累积的上下文（输入侧）总长度，
-// 与命中缓存公式一致（= cacheHitInputTokens / sessions）
-const avgContextPerSession = computed(() => {
-  const n = interactions.value;
-  return (
-    toolDef.value +
-    (inSeg.value * n * (n + 1)) / 2 +
-    (outSeg.value * (n - 1) * n) / 2
-  );
-});
+// 实际上下文长度：会话结束时累积的上下文总量
+// （历史输入 + 历史输出 + 思考 + 正文，对照真实会话统计的窗口占用）
+const avgContextPerSession = computed(
+  () => simulateSession.value.context,
+);
 
-const cacheHitInputTokens = computed(() => {
-  const n = interactions.value;
-  return (
-    sessions.value *
-    (toolDef.value +
-      (inSeg.value * n * (n + 1)) / 2 +
-      (outSeg.value * (n - 1) * n) / 2)
-  );
-});
+const cacheHitInputTokens = computed(
+  () => simulateSession.value.cacheHit * sessions.value,
+);
 
 const cacheMissInputTokens = computed(
-  () => totalInteractions.value * (inSeg.value + toolDef.value),
+  () => simulateSession.value.cacheMiss * sessions.value,
 );
 
 const totalInputTokens = computed(
@@ -131,7 +183,7 @@ function formatMoney(n: number): string {
       <GRow>
         <GCol :span="3" :xs="12">
           <div class="column">
-            <h2>价格(每百万 Token)</h2>
+            <h2>价格</h2>
             <div class="form">
               <label class="toggle-row">
                 <span>支持缓存</span>
@@ -139,6 +191,17 @@ function formatMoney(n: number): string {
                   <input type="checkbox" v-model="cacheEnabled" />
                   <span class="slider"></span>
                 </label>
+              </label>
+              <label :class="{ disabled: !cacheEnabled }">
+                <span>缓存概率</span>
+                <input
+                  v-model.number="cacheHitProb"
+                  type="number"
+                  min="0"
+                  max="1"
+                  step="0.01"
+                  :disabled="!cacheEnabled"
+                />
               </label>
               <label class="toggle-row">
                 <span>高峰时段（价格 ×2）</span>
@@ -180,92 +243,120 @@ function formatMoney(n: number): string {
         </GCol>
         <GCol :span="3" :xs="12">
           <div class="column">
-            <h2>交互习惯</h2>
+            <h2>Agent 模拟</h2>
             <div class="form">
               <label>
-                <span>每天会话次数</span>
-                <input v-model.number="sessions" type="number" min="1" />
+                <span>输出（每步思考 × 每轮正文）Token</span>
+                <div class="inline-inputs">
+                  <input
+                    v-model.number="thinkingTokensPerStep"
+                    type="number"
+                    min="0"
+                    step="1"
+                    placeholder="每步思考 Token"
+                  />
+                  <input
+                    v-model.number="replyTokensPerRound"
+                    type="number"
+                    min="0"
+                    step="1"
+                    placeholder="每轮正文 Token"
+                  />
+                </div>
               </label>
               <label>
-                <span>每次会话交互次数</span>
-                <input v-model.number="interactions" type="number" min="1" />
+                <span>工具定义（数量 × 每工具 Token）</span>
+                <div class="inline-inputs">
+                  <input
+                    v-model.number="toolCount"
+                    type="number"
+                    min="0"
+                    step="1"
+                    placeholder="数量"
+                  />
+                  <input
+                    v-model.number="toolDefTokens"
+                    type="number"
+                    min="0"
+                    step="1"
+                    placeholder="每工具定义 Token"
+                  />
+                </div>
               </label>
               <label>
-                <span>每次交互输入 Token</span>
-                <input v-model.number="inputTokens" type="number" min="1" />
+                <span>工具调用（每轮步数 × 每步调用数）</span>
+                <div class="inline-inputs">
+                  <input
+                    v-model.number="toolSteps"
+                    type="number"
+                    min="0"
+                    step="1"
+                    placeholder="每轮步数"
+                  />
+                  <input
+                    v-model.number="toolCallsPerStep"
+                    type="number"
+                    min="0"
+                    step="1"
+                    placeholder="每步调用数"
+                  />
+                </div>
               </label>
               <label>
-                <span>每次交互输出 Token</span>
-                <input v-model.number="outputTokens" type="number" min="1" />
+                <span>每工具调用（结果输入 × 调用输出）Token</span>
+                <div class="inline-inputs">
+                  <input
+                    v-model.number="toolResultTokens"
+                    type="number"
+                    min="0"
+                    step="1"
+                    placeholder="结果输入 Token"
+                  />
+                  <input
+                    v-model.number="toolCallOutputTokens"
+                    type="number"
+                    min="0"
+                    step="1"
+                    placeholder="调用输出 Token"
+                  />
+                </div>
               </label>
               <div class="result-row">
-                <span>平均会话上下文长度</span>
-                <span class="value">{{ formatNum(avgContextPerSession) }}</span>
+                <span>每轮 LLM 调用次数</span>
+                <span class="value">{{ formatNum(llmCallsPerRound) }}</span>
               </div>
             </div>
           </div>
         </GCol>
         <GCol :span="3" :xs="12">
           <div class="column">
-            <h2>工具调用（Agent 模拟）</h2>
+            <h2>交互习惯</h2>
             <div class="form">
-              <label class="toggle-row">
-                <span>模拟工具调用</span>
-                <label class="switch">
-                  <input type="checkbox" v-model="toolEnabled" />
-                  <span class="slider"></span>
-                </label>
-              </label>
-              <label :class="{ disabled: !toolEnabled }">
-                <span>工具定义数量</span>
+              <label>
+                <span>系统提示词 Token</span>
                 <input
-                  v-model.number="toolCount"
+                  v-model.number="systemPromptTokens"
                   type="number"
                   min="0"
-                  step="1"
-                  :disabled="!toolEnabled"
+                  step="1000"
                 />
               </label>
-              <label :class="{ disabled: !toolEnabled }">
-                <span>每工具定义 Token</span>
-                <input
-                  v-model.number="toolDefTokens"
-                  type="number"
-                  min="0"
-                  step="1"
-                  :disabled="!toolEnabled"
-                />
+              <label>
+                <span>每天会话次数</span>
+                <input v-model.number="sessions" type="number" min="1" />
               </label>
-              <label :class="{ disabled: !toolEnabled }">
-                <span>每次交互工具调用轮次</span>
-                <input
-                  v-model.number="toolRounds"
-                  type="number"
-                  min="0"
-                  step="1"
-                  :disabled="!toolEnabled"
-                />
+              <label>
+                <span>每会话对话轮数</span>
+                <input v-model.number="interactions" type="number" min="1" />
               </label>
-              <label :class="{ disabled: !toolEnabled }">
-                <span>每轮工具结果输入 Token</span>
-                <input
-                  v-model.number="toolResultTokens"
-                  type="number"
-                  min="0"
-                  step="1"
-                  :disabled="!toolEnabled"
-                />
+              <label>
+                <span>每轮输入 Token</span>
+                <input v-model.number="inputTokens" type="number" min="1" />
               </label>
-              <label :class="{ disabled: !toolEnabled }">
-                <span>每轮工具调用输出 Token</span>
-                <input
-                  v-model.number="toolCallTokens"
-                  type="number"
-                  min="0"
-                  step="1"
-                  :disabled="!toolEnabled"
-                />
-              </label>
+              <div class="result-row">
+                <span>会话上下文长度</span>
+                <span class="value">{{ formatNum(avgContextPerSession) }}</span>
+              </div>
             </div>
           </div>
         </GCol>
@@ -288,7 +379,7 @@ function formatMoney(n: number): string {
                 <span class="cost">{{ formatMoney(costCacheMiss) }}</span>
               </div>
               <div class="card highlight">
-                <span class="label">输出{{ toolEnabled ? "（含工具调用）" : "" }}</span>
+                <span class="label">输出（含工具调用）</span>
                 <span class="value">{{ formatNum(totalOutputTokens) }}</span>
                 <span class="cost">{{ formatMoney(costOutput) }}</span>
               </div>
@@ -337,6 +428,11 @@ h2 {
   flex-direction: column;
   gap: 6px;
   font-size: 13px;
+}
+
+.inline-inputs {
+  display: flex;
+  gap: 8px;
 }
 
 .form label.disabled {
@@ -424,6 +520,14 @@ h2 {
   flex-direction: column;
   gap: 6px;
   font-size: 13px;
+}
+
+.group-label {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
 }
 
 .result-row .value {
