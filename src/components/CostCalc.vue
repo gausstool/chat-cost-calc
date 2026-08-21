@@ -7,6 +7,7 @@ const inputTokens = ref(100);
 const outputTokens = ref(2000);
 
 const cacheEnabled = ref(true);
+const peakEnabled = ref(false);
 const cacheHitPrice = ref(0.05);
 const cacheMissPrice = ref(1.5);
 const outputPrice = ref(4.5);
@@ -56,19 +57,34 @@ const cacheHitPrecent = computed(() => {
   return ((100 * effectiveCacheHitInputTokens.value ) / (effectiveCacheHitInputTokens.value +  effectiveCacheMissInputTokens.value) ).toFixed(2)
 })
 
+// 高峰时段价格：高峰期花费为空闲期双倍（×2）
+const peakMultiplier = computed(() => (peakEnabled.value ? 2 : 1));
+const effectiveCacheHitPrice = computed(
+  () => cacheHitPrice.value * peakMultiplier.value,
+);
+const effectiveCacheMissPrice = computed(
+  () => cacheMissPrice.value * peakMultiplier.value,
+);
+const effectiveOutputPrice = computed(
+  () => outputPrice.value * peakMultiplier.value,
+);
+
 const costCacheMiss = computed(
   () =>
-    (effectiveCacheMissInputTokens.value / 1_000_000) * cacheMissPrice.value,
+    (effectiveCacheMissInputTokens.value / 1_000_000) *
+    effectiveCacheMissPrice.value,
 );
 
 const costCacheHit = computed(
-  () => (effectiveCacheHitInputTokens.value / 1_000_000) * cacheHitPrice.value,
+  () =>
+    (effectiveCacheHitInputTokens.value / 1_000_000) *
+    effectiveCacheHitPrice.value,
 );
 
 
 
 const costOutput = computed(
-  () => (totalOutputTokens.value / 1_000_000) * outputPrice.value,
+  () => (totalOutputTokens.value / 1_000_000) * effectiveOutputPrice.value,
 );
 const totalCost = computed(
   () => costCacheMiss.value + costCacheHit.value + costOutput.value,
@@ -96,6 +112,13 @@ function formatMoney(n: number): string {
                 <span>支持缓存</span>
                 <label class="switch">
                   <input type="checkbox" v-model="cacheEnabled" />
+                  <span class="slider"></span>
+                </label>
+              </label>
+              <label class="toggle-row">
+                <span>高峰时段（价格 ×2）</span>
+                <label class="switch">
+                  <input type="checkbox" v-model="peakEnabled" />
                   <span class="slider"></span>
                 </label>
               </label>
