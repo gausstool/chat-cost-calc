@@ -6,6 +6,14 @@ const interactions = ref(20);
 const inputTokens = ref(100);
 const outputTokens = ref(2000);
 
+// 工具调用模拟参数（真实 Agent 会话：工具定义常驻、交互内含多轮工具循环）
+const toolEnabled = ref(false);
+const toolCount = ref(3); // 工具定义数量
+const toolDefTokens = ref(300); // 每个工具定义的平均 Token
+const toolRounds = ref(2); // 每次交互平均工具调用轮次
+const toolResultTokens = ref(400); // 每轮工具结果回传输入 Token
+const toolCallTokens = ref(300); // 每轮工具调用（tool_use）输出 Token
+
 const cacheEnabled = ref(true);
 const peakEnabled = ref(false);
 const cacheHitPrice = ref(0.05);
@@ -14,8 +22,23 @@ const outputPrice = ref(4.5);
 
 const totalInteractions = computed(() => sessions.value * interactions.value);
 
+// 扩展段模型：每次交互的输入段 = 用户消息 + 工具结果回传（tool_result）
+const inSeg = computed(() =>
+  inputTokens.value +
+  (toolEnabled.value ? toolRounds.value * toolResultTokens.value : 0),
+);
+// 每次交互的输出段 = 最终答案 + 工具调用（tool_use）输出
+const outSeg = computed(() =>
+  outputTokens.value +
+  (toolEnabled.value ? toolRounds.value * toolCallTokens.value : 0),
+);
+// 工具定义前缀：真实 Agent 会话中每轮请求都会携带工具 schema（可缓存常量）
+const toolDef = computed(() =>
+  toolEnabled.value ? toolCount.value * toolDefTokens.value : 0,
+);
+
 const totalOutputTokens = computed(
-  () => totalInteractions.value * outputTokens.value,
+  () => totalInteractions.value * outSeg.value,
 );
 
 // 平均会话上下文长度：单次会话内逐次累积的上下文（输入侧）总长度，
@@ -23,8 +46,9 @@ const totalOutputTokens = computed(
 const avgContextPerSession = computed(() => {
   const n = interactions.value;
   return (
-    (inputTokens.value * n * (n + 1)) / 2 +
-    (outputTokens.value * (n - 1) * n) / 2
+    toolDef.value +
+    (inSeg.value * n * (n + 1)) / 2 +
+    (outSeg.value * (n - 1) * n) / 2
   );
 });
 
@@ -32,13 +56,14 @@ const cacheHitInputTokens = computed(() => {
   const n = interactions.value;
   return (
     sessions.value *
-    ((inputTokens.value * n * (n + 1)) / 2 +
-      (outputTokens.value * (n - 1) * n) / 2)
+    (toolDef.value +
+      (inSeg.value * n * (n + 1)) / 2 +
+      (outSeg.value * (n - 1) * n) / 2)
   );
 });
 
 const cacheMissInputTokens = computed(
-  () => totalInteractions.value * inputTokens.value,
+  () => totalInteractions.value * (inSeg.value + toolDef.value),
 );
 
 const totalInputTokens = computed(
@@ -104,7 +129,7 @@ function formatMoney(n: number): string {
     <h1>对话费用估算</h1>
     <div class="columns">
       <GRow>
-        <GCol :span="4" :xs="12">
+        <GCol :span="3" :xs="12">
           <div class="column">
             <h2>价格(每百万 Token)</h2>
             <div class="form">
@@ -153,7 +178,7 @@ function formatMoney(n: number): string {
             </div>
           </div>
         </GCol>
-        <GCol :span="4" :xs="12">
+        <GCol :span="3" :xs="12">
           <div class="column">
             <h2>交互习惯</h2>
             <div class="form">
@@ -180,7 +205,71 @@ function formatMoney(n: number): string {
             </div>
           </div>
         </GCol>
-        <GCol :span="4" :xs="12">
+        <GCol :span="3" :xs="12">
+          <div class="column">
+            <h2>工具调用（Agent 模拟）</h2>
+            <div class="form">
+              <label class="toggle-row">
+                <span>模拟工具调用</span>
+                <label class="switch">
+                  <input type="checkbox" v-model="toolEnabled" />
+                  <span class="slider"></span>
+                </label>
+              </label>
+              <label :class="{ disabled: !toolEnabled }">
+                <span>工具定义数量</span>
+                <input
+                  v-model.number="toolCount"
+                  type="number"
+                  min="0"
+                  step="1"
+                  :disabled="!toolEnabled"
+                />
+              </label>
+              <label :class="{ disabled: !toolEnabled }">
+                <span>每工具定义 Token</span>
+                <input
+                  v-model.number="toolDefTokens"
+                  type="number"
+                  min="0"
+                  step="1"
+                  :disabled="!toolEnabled"
+                />
+              </label>
+              <label :class="{ disabled: !toolEnabled }">
+                <span>每次交互工具调用轮次</span>
+                <input
+                  v-model.number="toolRounds"
+                  type="number"
+                  min="0"
+                  step="1"
+                  :disabled="!toolEnabled"
+                />
+              </label>
+              <label :class="{ disabled: !toolEnabled }">
+                <span>每轮工具结果输入 Token</span>
+                <input
+                  v-model.number="toolResultTokens"
+                  type="number"
+                  min="0"
+                  step="1"
+                  :disabled="!toolEnabled"
+                />
+              </label>
+              <label :class="{ disabled: !toolEnabled }">
+                <span>每轮工具调用输出 Token</span>
+                <input
+                  v-model.number="toolCallTokens"
+                  type="number"
+                  min="0"
+                  step="1"
+                  :disabled="!toolEnabled"
+                />
+              </label>
+            </div>
+          </div>
+        </GCol>
+        <GCol :span="3" :xs="12">
           <div class="column">
             <h2>预估消耗</h2>
             <div class="results">
@@ -199,7 +288,7 @@ function formatMoney(n: number): string {
                 <span class="cost">{{ formatMoney(costCacheMiss) }}</span>
               </div>
               <div class="card highlight">
-                <span class="label">输出</span>
+                <span class="label">输出{{ toolEnabled ? "（含工具调用）" : "" }}</span>
                 <span class="value">{{ formatNum(totalOutputTokens) }}</span>
                 <span class="cost">{{ formatMoney(costOutput) }}</span>
               </div>
@@ -217,7 +306,7 @@ function formatMoney(n: number): string {
 
 <style scoped>
 .calc {
-  max-width: 960px;
+  max-width: 1200px;
   margin: 0 auto;
   padding: 40px 0 0;
 }
