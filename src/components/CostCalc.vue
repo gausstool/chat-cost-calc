@@ -1,26 +1,26 @@
 <script setup lang="ts">
-import { ref, computed } from "vue";
+import { ref, computed, watch } from "vue";
 
 const sessions = ref(1);
-const interactions = ref(22);
-const inputTokens = ref(100);
+const interactions = ref(16);
+const inputTokens = ref(410);
 
 // 系统提示词：真实 Agent 会话中每轮请求都携带的常驻上下文（可缓存）
 const systemPromptTokens = ref(3000);
 
 // 工具调用模拟参数（真实 Agent 会话：轮 → 步 → 工具调用的三层结构）
-const toolCount = ref(10); // 工具定义数量
+const toolCount = ref(15); // 工具定义数量
 const toolDefTokens = ref(100); // 每个工具定义的平均 Token
-const toolSteps = ref(4); // 每轮对话平均工具调用步数
+const toolSteps = ref(3); // 每轮对话平均工具调用步数
 const toolCallsPerStep = ref(2); // 每步平均并行工具调用数
-const toolResultTokens = ref(400); // 每工具调用结果回传输入 Token
+const toolResultTokens = ref(1080); // 每工具调用结果回传输入 Token
 const toolCallOutputTokens = ref(150); // 每工具调用输出 Token（tool_use 生成）
 
 // Agent 输出：平均每步思考（reasoning，每次 LLM 调用都有，计输出；
 //            携带 tools 时按拼接规则进入上下文、参与缓存）
 //            + 平均每轮正文输出（最终回复，每轮一份，计输出、进入上下文）
-const thinkingTokensPerStep = ref(350); // 平均每步思考 Token
-const replyTokensPerRound = ref(650); // 平均每轮正文输出 Token
+const thinkingTokensPerStep = ref(80); // 平均每步思考 Token
+const replyTokensPerRound = ref(310); // 平均每轮正文输出 Token
 
 const cacheEnabled = ref(true);
 // 缓存命中概率：每一步 LLM 调用有 p 概率命中缓存，否则缓存前缀整段失效按未命中计费
@@ -32,8 +32,8 @@ const outputPrice = ref(4.5);
 
 const totalInteractions = computed(() => sessions.value * interactions.value);
 
-// 每轮 LLM 调用总步数 = 工具调用步数 + 1 次最终回复步（每步都是一次实际 LLM 调用）
-const llmCallsPerRound = computed(() => toolSteps.value + 1);
+// 每轮 LLM 调用总步数 = 1 次用户消息 + 工具调用步数 + 1 次最终回复步
+const llmCallsPerRound = computed(() => toolSteps.value + 2);
 
 // 固定上下文前缀：系统提示词 + 工具定义（真实 Agent 会话中每轮请求携带，可缓存）
 const constDef = computed(
@@ -56,38 +56,103 @@ const simulateSession = computed(() => {
   const p = cacheHitProb.value;
   let cacheHit = 0;
   let cacheMiss = 0;
-  let context = 0; // 会话内已累积的上下文（历史输入 + 历史输出，含思考当携带 tools）
+  let context = 0;
+
+  const rounds = [];
+  const steps = [];
+
   for (let r = 0; r < interactions.value; r++) {
-    // LLM 调用 1：新增用户消息；若有工具步则输出 tool_use，否则直接输出正文
+    let roundCacheHit = 0;
+    let roundCacheMiss = 0;
+    let roundOutput = 0;
+
+    // LLM 调用 1：用户消息
     const req1 = constDef.value + context;
-    cacheHit += p * req1;
-    cacheMiss += inputTokens.value + (1 - p) * req1;
+    const hit1 = p * req1;
+    const miss1 = inputTokens.value + (1 - p) * req1;
+    let out1 = 0;
     context += inputTokens.value;
     if (toolSteps.value > 0) {
-      context += toolCallsPerStep.value * toolCallOutputTokens.value;
+      const t1 = toolCallsPerStep.value * toolCallOutputTokens.value;
+      context += t1;
+      out1 += t1;
     }
-    if (hasTools.value) context += thinkingTokensPerStep.value;
-    // 工具调用步：每步回填工具结果后触发一次新的 LLM 调用
+    if (hasTools.value) {
+      context += thinkingTokensPerStep.value;
+      out1 += thinkingTokensPerStep.value;
+    }
+    roundCacheHit += hit1;
+    roundCacheMiss += miss1;
+    roundOutput += out1;
+    steps.push({
+      round: r + 1, step: 1, label: '用户消息',
+      cacheHit: hit1, cacheMiss: miss1, output: out1,
+      cost: (hit1 / 1e6) * effectiveCacheHitPrice.value + (miss1 / 1e6) * effectiveCacheMissPrice.value + (out1 / 1e6) * effectiveOutputPrice.value,
+      cumulativeContext: context,
+    });
+
+    // 工具调用步
     for (let s = 1; s <= toolSteps.value; s++) {
       const toolIn = toolCallsPerStep.value * toolResultTokens.value;
       const req = constDef.value + context;
-      cacheHit += p * req;
-      cacheMiss += toolIn + (1 - p) * req;
+      const hitS = p * req;
+      const missS = toolIn + (1 - p) * req;
+      let outS = 0;
       context += toolIn;
-      // 该步调用输出 tool_use 并进入上下文（最后一步除外，其输出为正文）
       if (s < toolSteps.value) {
-        context += toolCallsPerStep.value * toolCallOutputTokens.value;
+        const tS = toolCallsPerStep.value * toolCallOutputTokens.value;
+        context += tS;
+        outS += tS;
       }
-      if (hasTools.value) context += thinkingTokensPerStep.value;
+      if (hasTools.value) {
+        context += thinkingTokensPerStep.value;
+        outS += thinkingTokensPerStep.value;
+      }
+      roundCacheHit += hitS;
+      roundCacheMiss += missS;
+      roundOutput += outS;
+      steps.push({
+        round: r + 1, step: s + 1, label: `工具步 ${s}`,
+        cacheHit: hitS, cacheMiss: missS, output: outS,
+        cost: (hitS / 1e6) * effectiveCacheHitPrice.value + (missS / 1e6) * effectiveCacheMissPrice.value + (outS / 1e6) * effectiveOutputPrice.value,
+        cumulativeContext: context,
+      });
     }
-    // 最终回复步：请求输入与上一步完全相同（新增输入为 0），输出思考+正文
+
+    // 最终回复步
     const reqF = constDef.value + context;
-    cacheHit += p * reqF;
-    cacheMiss += (1 - p) * reqF;
-    context += (hasTools.value ? thinkingTokensPerStep.value : 0);
+    const hitF = p * reqF;
+    const missF = (1 - p) * reqF;
+    let outF = 0;
+    if (hasTools.value) {
+      context += thinkingTokensPerStep.value;
+      outF += thinkingTokensPerStep.value;
+    }
     context += replyTokensPerRound.value;
+    outF += replyTokensPerRound.value;
+    roundCacheHit += hitF;
+    roundCacheMiss += missF;
+    roundOutput += outF;
+    steps.push({
+      round: r + 1, step: toolSteps.value + 2, label: '最终回复',
+      cacheHit: hitF, cacheMiss: missF, output: outF,
+      cost: (hitF / 1e6) * effectiveCacheHitPrice.value + (missF / 1e6) * effectiveCacheMissPrice.value + (outF / 1e6) * effectiveOutputPrice.value,
+      cumulativeContext: context,
+    });
+
+    rounds.push({
+      round: r + 1,
+      cacheHit: roundCacheHit,
+      cacheMiss: roundCacheMiss,
+      output: roundOutput,
+      cost: (roundCacheHit / 1e6) * effectiveCacheHitPrice.value + (roundCacheMiss / 1e6) * effectiveCacheMissPrice.value + (roundOutput / 1e6) * effectiveOutputPrice.value,
+      cumulativeContext: context,
+    });
+
+    cacheHit += roundCacheHit;
+    cacheMiss += roundCacheMiss;
   }
-  return { cacheHit, cacheMiss, context };
+  return { cacheHit, cacheMiss, context, rounds, steps };
 });
 
 // 每轮输出 = 工具调用生成 + 思考（每次 LLM 调用都有）+ 每轮正文
@@ -167,12 +232,151 @@ const totalCost = computed(
   () => costCacheMiss.value + costCacheHit.value + costOutput.value,
 );
 
+// 图表粒度切换
+const chartGranularity = ref<'round' | 'step'>('round');
+const chartRef = ref<any>(null);
+
+// 切换粒度时更新图表
+watch(chartGranularity, () => {
+  const chart = chartRef.value?.chart;
+  if (chart) {
+    chart.updateOptions(chartOptions.value, true, true, false);
+  }
+});
+
+// 图表配置（ApexCharts）
+const chartSeries = computed(() => {
+  const data = chartGranularity.value === 'round'
+    ? simulateSession.value.rounds
+    : simulateSession.value.steps;
+  if (!data || data.length === 0) return [];
+  return [
+    { name: '命中缓存输入', data: data.map((r: any) => Math.round(r.cacheHit)) },
+    { name: '未命中缓存输入', data: data.map((r: any) => Math.round(r.cacheMiss)) },
+    { name: '输出', data: data.map((r: any) => Math.round(r.output)) },
+  ];
+});
+
+// tooltip 函数缓存，避免每次 computed 重建
+function tooltipFormatter({ series, seriesIndex, dataPointIndex, w }: any) {
+  const names = ['命中缓存输入', '未命中缓存输入', '输出'];
+  const prices = [
+    window.__chartPrices?.hit ?? 0.05,
+    window.__chartPrices?.miss ?? 1.5,
+    window.__chartPrices?.out ?? 4.5,
+  ];
+  let total = 0;
+  let rows = '';
+  for (let i = 0; i < series.length; i++) {
+    const v = series[i][dataPointIndex];
+    const c = (v / 1e6) * prices[i];
+    total += c;
+    const token = v >= 1000 ? Math.round(v / 1000) + 'k' : v;
+    rows += `<div style="display:flex;justify-content:space-between;gap:16px"><span>${names[i]}</span><span style="font-family:monospace">${token} <span style="opacity:.5">￥${c.toFixed(3)}</span></span></div>`;
+  }
+  const label = w.globals.categoryLabels[dataPointIndex] || '';
+  return `<div style="padding:6px 10px;font-size:12px;line-height:1.6">
+    <div style="font-weight:600;margin-bottom:4px">${label}</div>
+    ${rows}
+    <div style="border-top:1px solid rgba(128,128,128,.3);margin-top:4px;padding-top:4px;font-weight:600;display:flex;justify-content:space-between"><span>合计</span><span style="font-family:monospace">￥${total.toFixed(3)}</span></div>
+  </div>`;
+}
+
+// 同步价格到 window 供 tooltip 读取
+watch([effectiveCacheHitPrice, effectiveCacheMissPrice, effectiveOutputPrice], ([h, m, o]) => {
+  window.__chartPrices = { hit: h, miss: m, out: o };
+}, { immediate: true });
+
+const chartOptions = computed(() => {
+  const isRound = chartGranularity.value === 'round';
+  const data = isRound ? simulateSession.value.rounds : simulateSession.value.steps;
+  const categories = data
+    ? data.map((d: any) => isRound ? `T${d.round}` : `R${d.round}:S${d.step}`)
+    : [];
+  const isDark = document.documentElement.classList.contains('dark');
+  const textColor = isDark ? '#9ca3af' : '#6b6375';
+  const borderColor = isDark ? '#2e303a' : '#e5e4e7';
+  const count = data ? data.length : 0;
+
+  return {
+    chart: {
+      type: 'bar' as const,
+      stacked: true,
+      stackType: 'normal' as const,
+      toolbar: { show: false },
+      fontFamily: 'system-ui, sans-serif',
+      background: 'transparent',
+      animations: { enabled: false },
+    },
+    colors: ['#aa3bff', '#ff9500', '#34c759'],
+    plotOptions: {
+      bar: {
+        columnWidth: count > 60 ? '85%' : '70%',
+        borderRadius: 2,
+        borderRadiusApplication: 'end' as const,
+      },
+    },
+    dataLabels: { enabled: false },
+    stroke: { width: 0 },
+    xaxis: {
+      categories,
+      labels: {
+        show: isRound,
+        style: { colors: textColor, fontSize: '11px' },
+        rotate: count > 24 ? -45 : 0,
+        rotateAlways: count > 40,
+      },
+      axisBorder: { show: false },
+      axisTicks: { show: false },
+    },
+    yaxis: {
+      labels: {
+        style: { colors: textColor, fontSize: '11px' },
+        decimalsInFloat: 0,
+        formatter: (val: number) => {
+          if (val >= 1000000) return (val / 1000000) + 'M';
+          if (val >= 1000) return Math.round(val / 1000) + 'k';
+          return Math.round(val).toString();
+        },
+      },
+    },
+    legend: {
+      position: 'top' as const,
+      horizontalAlign: 'right' as const,
+      fontSize: '12px',
+      labels: { colors: textColor },
+      markers: { radius: 2 },
+    },
+    tooltip: {
+      shared: true,
+      intersect: false,
+      theme: isDark ? 'dark' : 'light',
+      custom: tooltipFormatter,
+    },
+    grid: {
+      borderColor,
+      strokeDashArray: 4,
+      xaxis: { lines: { show: false } },
+      yaxis: { lines: { show: true } },
+    },
+    fill: { opacity: 1 },
+    noData: { text: '暂无数据' },
+  };
+});
+
 function formatNum(n: number): string {
   return n.toLocaleString("en-US");
 }
 
 function formatMoney(n: number): string {
   return `￥${n.toFixed(3)}`;
+}
+
+function formatTokenShort(n: number): string {
+  if (n >= 1000) {
+    return (n / 1000).toFixed(1) + 'k';
+  }
+  return n.toString();
 }
 </script>
 
@@ -185,6 +389,13 @@ function formatMoney(n: number): string {
           <div class="column">
             <h2>价格</h2>
             <div class="form">
+              <label class="toggle-row">
+                <span>高峰时段（价格 ×2）</span>
+                <label class="switch">
+                  <input type="checkbox" v-model="peakEnabled" />
+                  <span class="slider"></span>
+                </label>
+              </label>
               <label class="toggle-row">
                 <span>支持缓存</span>
                 <label class="switch">
@@ -202,13 +413,6 @@ function formatMoney(n: number): string {
                   step="0.01"
                   :disabled="!cacheEnabled"
                 />
-              </label>
-              <label class="toggle-row">
-                <span>高峰时段（价格 ×2）</span>
-                <label class="switch">
-                  <input type="checkbox" v-model="peakEnabled" />
-                  <span class="slider"></span>
-                </label>
               </label>
               <label :class="{ disabled: !cacheEnabled }">
                 <span>输入（命中缓存）</span>
@@ -391,6 +595,32 @@ function formatMoney(n: number): string {
           </div>
         </GCol>
       </GRow>
+    </div>
+    
+    <!-- 图表面板 -->
+    <div class="chart-section">
+      <div class="chart-header">
+        <h3>{{ chartGranularity === 'round' ? '每轮消耗趋势' : '每步消耗趋势' }}</h3>
+        <div class="chart-toggle-group">
+          <button
+            :class="['toggle-btn', { active: chartGranularity === 'round' }]"
+            @click="chartGranularity = 'round'"
+          >轮次</button>
+          <button
+            :class="['toggle-btn', { active: chartGranularity === 'step' }]"
+            @click="chartGranularity = 'step'"
+          >步骤</button>
+        </div>
+      </div>
+      <div class="chart-wrapper" v-if="chartSeries.length > 0">
+        <apexchart
+          ref="chartRef"
+          type="bar"
+          height="360"
+          :options="chartOptions"
+          :series="chartSeries"
+        />
+      </div>
     </div>
   </div>
 </template>
@@ -598,5 +828,52 @@ h2 {
   font-weight: 500;
   color: var(--accent);
   font-family: var(--mono);
+}
+
+/* 图表相关样式 */
+.chart-section {
+  margin-top: 30px;
+}
+
+.chart-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 16px;
+}
+
+.chart-header h3 {
+  font-size: 16px;
+  font-weight: 500;
+  color: var(--text-h);
+  margin: 0;
+}
+
+.chart-toggle-group {
+  display: flex;
+  gap: 4px;
+  padding: 3px;
+  background: var(--code-bg);
+  border-radius: 8px;
+}
+
+.toggle-btn {
+  padding: 5px 14px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text);
+  font-size: 12px;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.toggle-btn.active {
+  background: var(--accent);
+  color: #fff;
+}
+
+.chart-wrapper {
+  width: 100%;
 }
 </style>
