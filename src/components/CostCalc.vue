@@ -4,15 +4,15 @@ import CostChart from "./CostChart.vue";
 
 const sessions = ref(1);
 const interactions = ref(16);
-const inputTokens = ref(410);
+const inputTokens = ref(50);
 
 // 系统提示词：真实 Agent 会话中每轮请求都携带的常驻上下文（可缓存）
 const systemPromptTokens = ref(3000);
 
 // 工具调用模拟参数（真实 Agent 会话：轮 → 步 → 工具调用的三层结构）
-const toolCount = ref(15); // 工具定义数量
+const toolCount = ref(25); // 工具定义数量
 const toolDefTokens = ref(100); // 每个工具定义的平均 Token
-const toolSteps = ref(3); // 每轮对话平均工具调用步数
+const toolSteps = ref(4); // 每轮对话平均工具调用步数
 const toolCallsPerStep = ref(2); // 每步平均并行工具调用数
 const toolResultTokens = ref(1080); // 每工具调用结果回传输入 Token
 const toolCallOutputTokens = ref(150); // 每工具调用输出 Token（tool_use 生成）
@@ -33,8 +33,8 @@ const outputPrice = ref(4.5);
 
 const totalInteractions = computed(() => sessions.value * interactions.value);
 
-// 每轮 LLM 调用总步数 = 1 次用户消息 + 工具调用步数 + 1 次最终回复步
-const llmCallsPerRound = computed(() => toolSteps.value + 2);
+// 每轮 LLM 调用总步数 = 工具调用步数 + 1 次最终回复步（最后一步无工具调用）
+const llmCallsPerRound = computed(() => toolSteps.value + 1);
 
 // 固定上下文前缀：系统提示词 + 工具定义（真实 Agent 会话中每轮请求携带，可缓存）
 const constDef = computed(
@@ -67,44 +67,21 @@ const simulateSession = computed(() => {
     let roundCacheMiss = 0;
     let roundOutput = 0;
 
-    // LLM 调用 1：用户消息
-    const req1 = constDef.value + context;
-    const hit1 = p * req1;
-    const miss1 = inputTokens.value + (1 - p) * req1;
-    let out1 = 0;
-    context += inputTokens.value;
-    if (toolSteps.value > 0) {
-      const t1 = toolCallsPerStep.value * toolCallOutputTokens.value;
-      context += t1;
-      out1 += t1;
-    }
-    if (hasTools.value) {
-      context += thinkingTokensPerStep.value;
-      out1 += thinkingTokensPerStep.value;
-    }
-    roundCacheHit += hit1;
-    roundCacheMiss += miss1;
-    roundOutput += out1;
-    steps.push({
-      round: r + 1, step: 1, label: '用户消息',
-      cacheHit: hit1, cacheMiss: miss1, output: out1,
-      cost: (hit1 / 1e6) * effectiveCacheHitPrice.value + (miss1 / 1e6) * effectiveCacheMissPrice.value + (out1 / 1e6) * effectiveOutputPrice.value,
-      cumulativeContext: context,
-    });
-
-    // 工具调用步
+    // 工具调用步（第 1 步包含用户消息输入）
     for (let s = 1; s <= toolSteps.value; s++) {
-      const toolIn = toolCallsPerStep.value * toolResultTokens.value;
+      // 新输入：第 1 步是用户消息，后续步是工具结果
+      const newInput = s === 1
+        ? inputTokens.value
+        : toolCallsPerStep.value * toolResultTokens.value;
       const req = constDef.value + context;
       const hitS = p * req;
-      const missS = toolIn + (1 - p) * req;
+      const missS = newInput + (1 - p) * req;
       let outS = 0;
-      context += toolIn;
-      if (s < toolSteps.value) {
-        const tS = toolCallsPerStep.value * toolCallOutputTokens.value;
-        context += tS;
-        outS += tS;
-      }
+      context += newInput;
+      // 输出 tool_use（所有工具步都输出）
+      const toolOut = toolCallsPerStep.value * toolCallOutputTokens.value;
+      context += toolOut;
+      outS += toolOut;
       if (hasTools.value) {
         context += thinkingTokensPerStep.value;
         outS += thinkingTokensPerStep.value;
@@ -113,14 +90,14 @@ const simulateSession = computed(() => {
       roundCacheMiss += missS;
       roundOutput += outS;
       steps.push({
-        round: r + 1, step: s + 1, label: `工具步 ${s}`,
+        round: r + 1, step: s, label: s === 1 ? '用户消息' : `工具步 ${s - 1}`,
         cacheHit: hitS, cacheMiss: missS, output: outS,
         cost: (hitS / 1e6) * effectiveCacheHitPrice.value + (missS / 1e6) * effectiveCacheMissPrice.value + (outS / 1e6) * effectiveOutputPrice.value,
         cumulativeContext: context,
       });
     }
 
-    // 最终回复步
+    // 最终回复步（无工具调用，输出正文）
     const reqF = constDef.value + context;
     const hitF = p * reqF;
     const missF = (1 - p) * reqF;
@@ -135,7 +112,7 @@ const simulateSession = computed(() => {
     roundCacheMiss += missF;
     roundOutput += outF;
     steps.push({
-      round: r + 1, step: toolSteps.value + 2, label: '最终回复',
+      round: r + 1, step: toolSteps.value + 1, label: '最终回复',
       cacheHit: hitF, cacheMiss: missF, output: outF,
       cost: (hitF / 1e6) * effectiveCacheHitPrice.value + (missF / 1e6) * effectiveCacheMissPrice.value + (outF / 1e6) * effectiveOutputPrice.value,
       cumulativeContext: context,
@@ -171,9 +148,9 @@ const totalOutputTokens = computed(
 );
 
 // 实际上下文长度：会话结束时累积的上下文总量
-// （历史输入 + 历史输出 + 思考 + 正文，对照真实会话统计的窗口占用）
+// （固定前缀 + 历史输入 + 历史输出 + 思考 + 正文，对照真实会话统计的窗口占用）
 const avgContextPerSession = computed(
-  () => simulateSession.value.context,
+  () => constDef.value + simulateSession.value.context,
 );
 
 const cacheHitInputTokens = computed(
@@ -232,6 +209,19 @@ const costOutput = computed(
 const totalCost = computed(
   () => costCacheMiss.value + costCacheHit.value + costOutput.value,
 );
+
+// 平均每步统计
+const avgPerStep = computed(() => {
+  const steps = simulateSession.value.steps;
+  if (!steps || steps.length === 0) return { input: 0, cacheHit: 0, output: 0, cost: 0 };
+  const n = steps.length;
+  return {
+    input: Math.round(steps.reduce((s, step) => s + step.cacheHit + step.cacheMiss, 0) / n),
+    cacheHit: Math.round(steps.reduce((s, step) => s + step.cacheHit, 0) / n),
+    output: Math.round(steps.reduce((s, step) => s + step.output, 0) / n),
+    cost: steps.reduce((s, step) => s + step.cost, 0) / n,
+  };
+});
 
 function formatNum(n: number): string {
   return n.toLocaleString("en-US");
@@ -374,6 +364,7 @@ function formatTokenShort(n: number): string {
                     placeholder="每步调用数"
                   />
                 </div>
+                <span class="hint">每轮 {{ llmCallsPerRound }} 步 LLM 调用，最后一步无工具调用</span>
               </label>
               <label>
                 <span>每工具调用（结果输入 × 调用输出）Token</span>
@@ -464,6 +455,26 @@ function formatTokenShort(n: number): string {
           </div>
         </GCol>
       </GRow>
+    </div>
+    
+    <!-- 平均每步统计 -->
+    <div class="avg-stats">
+      <div class="avg-item">
+        <span class="avg-label">平均每步输入</span>
+        <span class="avg-value">{{ formatNum(avgPerStep.input) }}</span>
+      </div>
+      <div class="avg-item">
+        <span class="avg-label">命中缓存</span>
+        <span class="avg-value">{{ formatNum(avgPerStep.cacheHit) }}</span>
+      </div>
+      <div class="avg-item">
+        <span class="avg-label">平均每步输出</span>
+        <span class="avg-value">{{ formatNum(avgPerStep.output) }}</span>
+      </div>
+      <div class="avg-item">
+        <span class="avg-label">平均每步费用</span>
+        <span class="avg-value">{{ formatMoney(avgPerStep.cost) }}</span>
+      </div>
     </div>
     
     <!-- 图表面板 -->
@@ -679,6 +690,34 @@ h2 {
   font-size: 14px;
   font-weight: 500;
   color: var(--accent);
+  font-family: var(--mono);
+}
+
+.avg-stats {
+  display: flex;
+  justify-content: center;
+  gap: 32px;
+  padding: 16px 0;
+  margin: 20px 0;
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+}
+
+.avg-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.avg-label {
+  font-size: 13px;
+  color: var(--text);
+}
+
+.avg-value {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-h);
   font-family: var(--mono);
 }
 </style>
